@@ -1,3 +1,8 @@
+import os
+from pathlib import Path
+
+APP_HOME = Path(os.environ.get("ASTROEDITORPRO_HOME", str(Path.home() / ".local/share/astroeditorpro"))).expanduser()
+
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
@@ -80,7 +85,6 @@ import fcntl
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-APP_HOME = Path(os.environ.get("ASTROEDITORPRO_HOME", str(Path.home() / ".local/share/astroeditorpro"))).expanduser()
 
 from PySide6.QtCore import QFileSystemWatcher, QEvent, QPoint, QRect, QSaveFile, QSize, Qt, QTimer
 from PySide6.QtGui import (
