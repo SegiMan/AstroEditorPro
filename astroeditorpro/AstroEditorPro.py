@@ -1012,6 +1012,7 @@ def language_package_name(code):
 
 
 
+@dataclass
 class DocumentInfo:
     path: str | None = None
     autosave_path: str | None = None
@@ -1021,6 +1022,23 @@ class DocumentInfo:
     annotations: list = field(default_factory=list)
     bookmarks: list = field(default_factory=list)
 
+
+    def __post_init__(self):
+        # Defensive normalization. If a generated/broken version ever lets
+        # dataclasses.field objects reach runtime, convert them to safe values.
+        from dataclasses import Field
+        if isinstance(self.annotations, Field) or self.annotations is None:
+            self.annotations = []
+        if isinstance(self.bookmarks, Field) or self.bookmarks is None:
+            self.bookmarks = []
+        if isinstance(self.path, Field):
+            self.path = None
+        if isinstance(self.autosave_path, Field):
+            self.autosave_path = None
+        if isinstance(self.title, Field) or not self.title:
+            self.title = "Untitled"
+        self.annotations = list(self.annotations)
+        self.bookmarks = list(self.bookmarks)
 
 
 class LineNumberArea(QWidget):
@@ -1041,6 +1059,14 @@ class EditorTab(QWidget):
         super().__init__()
         self.main = main
         self.doc = doc or DocumentInfo()
+        # Runtime guard against older/broken generated DocumentInfo objects
+        # where dataclasses.field leaked into annotations/bookmarks.
+        from dataclasses import Field
+        if isinstance(getattr(self.doc, "annotations", None), Field) or self.doc.annotations is None:
+            self.doc.annotations = []
+        if isinstance(getattr(self.doc, "bookmarks", None), Field) or self.doc.bookmarks is None:
+            self.doc.bookmarks = []
+
         self.autosave_timer = QTimer(self)
         self.autosave_timer.setSingleShot(True)
         self.autosave_timer.timeout.connect(self.autosave)
