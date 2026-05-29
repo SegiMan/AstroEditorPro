@@ -1,0 +1,54 @@
+name: astroeditorpro
+base: core24
+version: '0.1'
+summary: Rich text editor with annotations and self-contained AEP files
+description: |
+  AstroEditorPro is a PySide6 rich text editor with tabs, autosave,
+  annotations, bookmarks, workspaces and self-contained .aep documents.
+
+grade: devel
+confinement: strict
+
+apps:
+  astroeditorpro:
+    command: bin/astroeditorpro-snap
+    desktop: share/applications/astroeditorpro.desktop
+    plugs:
+      - desktop
+      - desktop-legacy
+      - wayland
+      - x11
+      - home
+      - removable-media
+      - opengl
+      - gsettings
+
+parts:
+  astroeditorpro:
+    plugin: python
+    source: .
+    python-requirements:
+      - requirements.txt
+    stage-packages:
+      - python3-pyside6.qtcore
+      - python3-pyside6.qtgui
+      - python3-pyside6.qtwidgets
+      - hunspell-en-gb
+      - hunspell-hr
+      - shared-mime-info
+    override-build: |
+      craftctl default
+      mkdir -p "$CRAFT_PART_INSTALL/bin"
+      mkdir -p "$CRAFT_PART_INSTALL/share/astroeditorpro"
+      cp astroeditorpro/AstroEditorPro.py "$CRAFT_PART_INSTALL/share/astroeditorpro/"
+      cp astroeditorpro/shortcuts.conf "$CRAFT_PART_INSTALL/share/astroeditorpro/"
+      cp assets/AstroEditorIcon.png "$CRAFT_PART_INSTALL/share/astroeditorpro/" || true
+      cat > "$CRAFT_PART_INSTALL/bin/astroeditorpro-snap" <<'EOF'
+      #!/usr/bin/env bash
+      export ASTROEDITORPRO_HOME="$SNAP_USER_DATA"
+      mkdir -p "$ASTROEDITORPRO_HOME"
+      cp "$SNAP/share/astroeditorpro/shortcuts.conf" "$ASTROEDITORPRO_HOME/shortcuts.conf" 2>/dev/null || true
+      cp "$SNAP/share/astroeditorpro/AstroEditorIcon.png" "$ASTROEDITORPRO_HOME/AstroEditorIcon.png" 2>/dev/null || true
+      exec python3 "$SNAP/share/astroeditorpro/AstroEditorPro.py" "$@"
+      EOF
+      chmod +x "$CRAFT_PART_INSTALL/bin/astroeditorpro-snap"
