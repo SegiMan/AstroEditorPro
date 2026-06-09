@@ -145,7 +145,7 @@ from PySide6.QtWidgets import (
 
 
 APP_NAME = "AstroEditorPro Qt"
-APP_VERSION = "pro_v9_spellcheck_language_manager"
+APP_VERSION = "pro_v10_async_session_restore"
 APP_ICON_PATH = str(APP_HOME / "AstroEditorIcon.png")
 APP_DESKTOP_ID = "astroeditorpro"
 APP_DISPLAY_NAME = "AstroEditorPro"
@@ -161,6 +161,15 @@ COPY_STORAGE_FILE = "pro_copy_storage.json"
 RESTORE_QT_BINARY_WINDOW_STATE = False
 MAX_RESTORED_TABS = 30
 MAX_AUTOSAVE_FILE_BYTES = 50 * 1024 * 1024
+
+# Startup/session-restore hardening.
+# Last tabs remain a core feature, but they are restored after the first window
+# is visible and in small batches so the GUI event loop stays responsive.
+SESSION_RESTORE_BATCH_SIZE = 1
+SESSION_RESTORE_BATCH_DELAY_MS = 30
+MAX_STARTUP_AUTOSAVE_FILE_BYTES = 50 * 1024 * 1024
+MAX_SPELLCHECK_CHARS = 60000
+SPELLCHECK_DELAY_MS = 1600
 
 DEFAULT_SHORTCUTS = {
     "bold": "Ctrl+B",
@@ -877,9 +886,9 @@ class SpellCheckerManager:
         self.enabled = False
         self.dictionaries = []
         self.user_words = set()
-        self.selected_languages = list(selected_languages or SPELLCHECK_LANGUAGES)
+        # Do not load Hunspell dictionaries during startup. Load lazily when needed.
+        self.selected_languages = list(selected_languages or [])
         self.load_user_dictionary()
-        self.load_dictionaries(self.selected_languages)
 
     @staticmethod
     def dictionary_base_dir():
@@ -1037,8 +1046,6 @@ class DocumentInfo:
             self.autosave_path = None
         if isinstance(self.title, Field) or not self.title:
             self.title = "Untitled"
-        self.annotations = list(self.annotations)
-        self.bookmarks = list(self.bookmarks)
 
 
 class LineNumberArea(QWidget):
@@ -1124,53 +1131,50 @@ class EditorTab(QWidget):
         return super().eventFilter(obj, event)
 
     def schedule_spellcheck(self):
-        # AstroEditorPro emulated multi-selections.
-        for start, end in getattr(self, "multi_selections", []):
-            cursor = QTextCursor(self.editor.document())
-            cursor.setPosition(start)
-            cursor.setPosition(end, QTextCursor.KeepAnchor)
-            selection = QTextEdit.ExtraSelection()
-            selection.cursor = cursor
-            fmt = QTextCharFormat()
-            fmt.setBackground(QColor("#3355aa"))
-            selection.format = fmt
-            selections.append(selection)
-
-        # Ctrl+Shift column selection preview.
-        if getattr(self, "column_selecting", False) and self.column_start is not None and self.column_end is not None:
-            for start, end in self.column_ranges_from_points(self.column_start, self.column_end):
-                cursor = QTextCursor(self.editor.document())
-                cursor.setPosition(start)
-                cursor.setPosition(end, QTextCursor.KeepAnchor)
-                selection = QTextEdit.ExtraSelection()
-                selection.cursor = cursor
-                fmt = QTextCharFormat()
-                fmt.setBackground(QColor("#553388"))
-                selection.format = fmt
-                selections.append(selection)
-
         if self.main.prefs.get("spellcheck_enabled", False):
-            self.spellcheck_timer.start(700)
+            if self.editor.document().characterCount() > MAX_SPELLCHECK_CHARS:
+                self.misspellings = []
+                self.apply_annotations()
+                self.main.status("Spellcheck skipped for a large document.")
+                return
+            self.spellcheck_timer.start(SPELLCHECK_DELAY_MS)
         else:
-            self.misspellings = []
-            self.apply_annotations()
+            self.spellcheck_timer.stop()
+            if self.misspellings:
+                self.misspellings = []
+                self.apply_annotations()
 
     def run_spellcheck(self):
         if not self.main.prefs.get("spellcheck_enabled", False):
             self.misspellings = []
             self.apply_annotations()
             return
-        langs = self.main.current_spellcheck_languages() if hasattr(self.main, 'current_spellcheck_languages') else ['en_GB', 'hr_HR']
+
+        text = self.editor.toPlainText()
+        if len(text) > MAX_SPELLCHECK_CHARS:
+            self.misspellings = []
+            self.apply_annotations()
+            self.main.status("Spellcheck skipped for a large document.")
+            return
+
+        langs = self.main.current_spellcheck_languages() if hasattr(self.main, "current_spellcheck_languages") else []
+        langs = [l for l in langs if l]
         if not langs:
             self.misspellings = []
             self.apply_annotations()
             self.editor.viewport().update()
             return
-        self.main.spellchecker.enabled = True
-        old_dicts = self.main.spellchecker.dictionaries
-        self.main.spellchecker.dictionaries = [(l, d) for (l, d) in old_dicts if l in langs]
-        self.misspellings = self.main.spellchecker.misspellings(self.editor.toPlainText())
-        self.main.spellchecker.dictionaries = old_dicts
+
+        try:
+            self.main.ensure_spellchecker_loaded(langs)
+            old_dicts = self.main.spellchecker.dictionaries
+            self.main.spellchecker.dictionaries = [(l, d) for (l, d) in old_dicts if l in langs]
+            self.misspellings = self.main.spellchecker.misspellings(text)
+            self.main.spellchecker.dictionaries = old_dicts
+        except Exception as exc:
+            print(f"AstroEditor spellcheck failed: {exc}", flush=True)
+            self.misspellings = []
+
         self.apply_annotations()
         self.editor.viewport().update()
 
@@ -2592,8 +2596,8 @@ class MainWindow(QMainWindow):
             "last_file_folder": str(Path.home()),
         })
 
-        self.spellchecker = SpellCheckerManager(self.prefs.get("spellcheck_languages", SPELLCHECK_LANGUAGES))
-        self.spellchecker.enabled = bool(self.prefs.get("spellcheck_enabled", False))
+        self.spellchecker = SpellCheckerManager([])
+        self.spellchecker.enabled = False
 
         self.shortcuts_path = Path(SHORTCUTS_FILE).expanduser()
         self.shortcuts = parse_shortcuts(str(self.shortcuts_path))
@@ -3165,16 +3169,31 @@ class MainWindow(QMainWindow):
         tab.run_spellcheck()
         self.status(f"Replaced with '{replacement}'.")
 
+    def ensure_spellchecker_loaded(self, selected_languages):
+        selected_languages = list(selected_languages or [])
+        current = list(getattr(self.spellchecker, "selected_languages", []) or [])
+        have = [lang for lang, _dict in getattr(self.spellchecker, "dictionaries", [])]
+        if selected_languages != current or sorted(have) != sorted(selected_languages):
+            self.spellchecker.reload(selected_languages)
+
     def apply_spellcheck_preference(self):
-        selected_languages = self.prefs.get("spellcheck_languages", SPELLCHECK_LANGUAGES)
-        self.spellchecker.reload(selected_languages)
-        self.spellchecker.enabled = bool(self.prefs.get("spellcheck_enabled", False)) and bool(selected_languages)
+        selected_languages = list(self.prefs.get("spellcheck_languages", SPELLCHECK_LANGUAGES) or [])
+        enabled = bool(self.prefs.get("spellcheck_enabled", False)) and bool(selected_languages)
+        self.spellchecker.enabled = enabled
+
+        if enabled:
+            QTimer.singleShot(300, lambda: self.ensure_spellchecker_loaded(selected_languages))
+        else:
+            self.spellchecker.dictionaries = []
+            self.spellchecker.selected_languages = []
+
         for i in range(self.tabs.count()):
             tab = self.tabs.widget(i)
             if isinstance(tab, EditorTab):
-                if self.spellchecker.enabled:
-                    tab.run_spellcheck()
+                if enabled:
+                    tab.schedule_spellcheck()
                 else:
+                    tab.spellcheck_timer.stop()
                     tab.misspellings = []
                     tab.apply_annotations()
                     tab.editor.viewport().update()
@@ -3454,11 +3473,13 @@ class MainWindow(QMainWindow):
         self.workspace_root = None
 
     def schedule_outline_refresh(self):
-        if hasattr(self, "outline_timer"):
-            self.outline_timer.start(500)
+        if hasattr(self, "outline_timer") and hasattr(self, "outline_dock") and self.outline_dock.isVisible():
+            self.outline_timer.start(1200)
 
     def refresh_outline(self):
         if not hasattr(self, "outline_tree"):
+            return
+        if hasattr(self, "outline_dock") and not self.outline_dock.isVisible():
             return
         tab = self.current_tab()
         self.outline_tree.clear()
@@ -5010,11 +5031,90 @@ class MainWindow(QMainWindow):
         print(f"AstroEditor injected startup files into restored session: {injected_paths}", flush=True)
         return state
 
+    def prepare_async_session_restore(self, state):
+        """Prepare previous tabs for non-blocking restoration after the GUI is visible."""
+        self._pending_session_restore_tabs = []
+        self._session_restore_active = False
+
+        for item in state.get("tabs", [])[:MAX_RESTORED_TABS]:
+            if not isinstance(item, dict):
+                continue
+            autosave = item.get("autosave_path")
+            path = item.get("path")
+            candidate = autosave or path
+            if not candidate:
+                continue
+            try:
+                p = Path(candidate).expanduser()
+                if not p.exists() or not p.is_file():
+                    continue
+                if p.stat().st_size > MAX_STARTUP_AUTOSAVE_FILE_BYTES:
+                    print(f"AstroEditor skipped large startup restore file: {p}", flush=True)
+                    continue
+                self._pending_session_restore_tabs.append(item)
+            except Exception as exc:
+                print(f"AstroEditor skipped bad startup restore entry: {candidate}: {exc}", flush=True)
+
+    def start_async_session_restore(self):
+        """Restore saved tabs in small chunks so the visible GUI keeps responding."""
+        pending = list(getattr(self, "_pending_session_restore_tabs", []) or [])
+        if not pending:
+            if self.tabs.count() == 0:
+                self.new_tab()
+            QTimer.singleShot(0, self.restore_saved_view_state)
+            return
+
+        self._session_restore_active = True
+        self.status(f"Restoring previous session: 0/{len(pending)}")
+        QTimer.singleShot(0, self.restore_next_session_batch)
+
+    def restore_next_session_batch(self):
+        pending = getattr(self, "_pending_session_restore_tabs", [])
+        total = getattr(self, "_session_restore_total", None)
+        if total is None:
+            self._session_restore_total = len(pending)
+            total = self._session_restore_total
+
+        count = 0
+        while pending and count < SESSION_RESTORE_BATCH_SIZE:
+            item = pending.pop(0)
+            try:
+                autosave = item.get("autosave_path")
+                path = item.get("path")
+
+                if autosave and Path(autosave).exists():
+                    self.open_autosave(autosave)
+                elif path and Path(path).exists():
+                    self.open_file(path)
+            except Exception as exc:
+                print(f"AstroEditor skipped one restored tab: {exc}", flush=True)
+            count += 1
+
+        restored = total - len(pending)
+        self.status(f"Restoring previous session: {restored}/{total}")
+
+        if pending:
+            QTimer.singleShot(SESSION_RESTORE_BATCH_DELAY_MS, self.restore_next_session_batch)
+            return
+
+        self._session_restore_active = False
+
+        # Remove temporary loading tab only after at least one real tab was restored.
+        for i in reversed(range(self.tabs.count())):
+            tab = self.tabs.widget(i)
+            if getattr(tab, "_temporary_loading_tab", False) and self.tabs.count() > 1:
+                self.tabs.removeTab(i)
+                tab.deleteLater()
+
+        if self.tabs.count() == 0:
+            self.new_tab()
+
+        QTimer.singleShot(0, self.restore_saved_view_state)
+        self.status("Previous session restored.")
+
     def load_state_or_new(self):
-        # Robust startup:
-        # - do not trust old/corrupt state.json blindly
-        # - do not restore Qt's opaque binary window_state unless enabled
-        # - if New Window was requested, open a blank window but keep preferences/view visibility
+        # Last-open-tabs restoration remains automatic, but it is now asynchronous:
+        # the window appears first, then saved tabs are restored in small batches.
         state = self.load_state_safely()
 
         geometry_hex = state.get("geometry")
@@ -5027,36 +5127,39 @@ class MainWindow(QMainWindow):
         self._pending_window_state_hex = state.get("window_state") if RESTORE_QT_BINARY_WINDOW_STATE else None
         self._pending_view_state = state.get("view_state", {})
 
-        if not getattr(self, "restore_session", True):
-            self.new_tab()
+        # Open explicit file-manager/command-line files immediately.
+        if getattr(self, "startup_files", None):
+            opened = False
+            for raw_path in self.startup_files:
+                try:
+                    p = self.normalize_startup_path(raw_path)
+                    if p is not None and p.exists():
+                        if is_autosave_file(p):
+                            opened = self.open_autosave(str(p)) or opened
+                        else:
+                            opened = bool(self.open_file(str(p))) or opened
+                except Exception as exc:
+                    print(f"AstroEditor skipped startup file {raw_path}: {exc}", flush=True)
+            if not opened:
+                self.new_tab()
             QTimer.singleShot(0, self.restore_saved_view_state)
             return
 
-        state = self.inject_startup_files_into_state(state)
+        self.prepare_async_session_restore(state)
 
-        opened = False
-        for item in state.get("tabs", []):
-            try:
-                autosave = item.get("autosave_path")
-                path = item.get("path")
-
-                if autosave and Path(autosave).exists():
-                    opened = self.open_autosave(autosave) or opened
-                elif path and Path(path).exists():
-                    opened_tab = self.open_file(path)
-                    if not opened_tab:
-                        print(f"AstroEditor failed to restore/open path from state: {path}", flush=True)
-                    opened = bool(opened_tab) or opened
-            except Exception as exc:
-                print(f"AstroEditor skipped one bad restored tab: {exc}", flush=True)
-
-        if not opened:
+        if getattr(self, "_pending_session_restore_tabs", None):
+            loading_tab = self.new_tab()
+            if loading_tab is not None:
+                loading_tab._temporary_loading_tab = True
+                loading_tab.editor.setPlainText("Restoring previous AstroEditorPro session...")
+                loading_tab.editor.setReadOnly(True)
+                idx = self.tabs.indexOf(loading_tab)
+                if idx >= 0:
+                    self.tabs.setTabText(idx, "Restoring session...")
+            QTimer.singleShot(0, self.start_async_session_restore)
+        else:
             self.new_tab()
-
-        QTimer.singleShot(0, self.restore_saved_view_state)
-        if getattr(self, "_injected_startup_paths", None):
-            self.status("Opened command-line/Open-With file(s): " + ", ".join(Path(p).name for p in self._injected_startup_paths))
-            self.setWindowTitle(APP_DISPLAY_NAME + " — opened: " + ", ".join(Path(p).name for p in self._injected_startup_paths[:2]))
+            QTimer.singleShot(0, self.restore_saved_view_state)
 
     def schedule_save_state(self):
         # Save soon, after Qt has applied visibility/layout changes.
