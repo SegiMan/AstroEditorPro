@@ -87,6 +87,7 @@ from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QFileSystemWatcher, QEvent, QPoint, QRect, QSaveFile, QSize, Qt, QTimer
+from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtGui import (
     QAction,
     QActionGroup,
@@ -145,9 +146,10 @@ from PySide6.QtWidgets import (
 
 
 APP_NAME = "AstroEditorPro Qt"
-APP_VERSION = "pro_v10_async_session_restore"
+APP_VERSION = "pro_v14_preserve_fullscreen_on_external_open"
 APP_ICON_PATH = str(APP_HOME / "AstroEditorIcon.png")
 APP_DESKTOP_ID = "astroeditorpro"
+SINGLE_INSTANCE_SERVER_NAME = f"{APP_DESKTOP_ID}-{os.getuid()}"
 APP_DISPLAY_NAME = "AstroEditorPro"
 AUTOSAVE_DELAY_MS = 3000
 STATE_FILE = "pro_state.json"
@@ -2641,6 +2643,11 @@ class MainWindow(QMainWindow):
             self.shortcut_watcher.addPath(str(self.shortcuts_path))
         self.shortcut_watcher.fileChanged.connect(lambda _p: self.reload_shortcuts())
 
+        # Apply saved spellcheck preference automatically at startup. This must
+        # mirror the Preferences OK path; otherwise spellcheck only starts after
+        # opening Preferences and pressing OK.
+        QTimer.singleShot(0, self.activate_spellcheck_after_startup)
+
     def save_copy_storage(self):
         # Keep newest first, avoid duplicates, and prevent unbounded growth.
         cleaned = []
@@ -3176,23 +3183,72 @@ class MainWindow(QMainWindow):
         if selected_languages != current or sorted(have) != sorted(selected_languages):
             self.spellchecker.reload(selected_languages)
 
+    def ensure_spellchecker_loaded_and_start(self, selected_languages):
+        """Lazy-load dictionaries, then start spellcheck on already-open tabs.
+
+        This keeps startup responsive but avoids the previous behaviour where
+        spellcheck only began after the Preferences dialog was opened/closed.
+        """
+        if not self.prefs.get("spellcheck_enabled", False):
+            return
+
+        selected_languages = list(selected_languages or [])
+        if not selected_languages:
+            return
+
+        try:
+            self.ensure_spellchecker_loaded(selected_languages)
+        except Exception as exc:
+            print(f"AstroEditor spellcheck dictionary load failed: {exc}", flush=True)
+            self.status(f"Spellcheck dictionary load failed: {exc}")
+            return
+
+        if not getattr(self.spellchecker, "dictionaries", None):
+            self.status("Spellcheck enabled, but no selected dictionaries are available.")
+            return
+
+        for i in range(self.tabs.count()):
+            tab = self.tabs.widget(i)
+            if isinstance(tab, EditorTab):
+                tab.schedule_spellcheck()
+
+        self.status("Spellcheck ready.")
+
+    def schedule_spellcheck_for_all_tabs(self, delay_ms=250):
+        if not self.prefs.get("spellcheck_enabled", False):
+            return
+        for i in range(self.tabs.count()):
+            tab = self.tabs.widget(i)
+            if isinstance(tab, EditorTab):
+                QTimer.singleShot(delay_ms + i * 50, tab.schedule_spellcheck)
+
+    def activate_spellcheck_after_startup(self):
+        """Apply saved spellcheck preference without opening Preferences.
+
+        The Preferences OK button already called apply_spellcheck_preference().
+        Startup did not, so spellcheck stayed inactive until OK was pressed.
+        """
+        if not self.prefs.get("spellcheck_enabled", False):
+            return
+        self.apply_spellcheck_preference()
+
     def apply_spellcheck_preference(self):
         selected_languages = list(self.prefs.get("spellcheck_languages", SPELLCHECK_LANGUAGES) or [])
         enabled = bool(self.prefs.get("spellcheck_enabled", False)) and bool(selected_languages)
         self.spellchecker.enabled = enabled
 
         if enabled:
-            QTimer.singleShot(300, lambda: self.ensure_spellchecker_loaded(selected_languages))
+            # Load lazily after the window is responsive, then automatically
+            # schedule spellcheck for all existing tabs once dictionaries are ready.
+            # Do not run an immediate pre-load pass here.
+            QTimer.singleShot(100, lambda langs=selected_languages: self.ensure_spellchecker_loaded_and_start(langs))
         else:
             self.spellchecker.dictionaries = []
             self.spellchecker.selected_languages = []
 
-        for i in range(self.tabs.count()):
-            tab = self.tabs.widget(i)
-            if isinstance(tab, EditorTab):
-                if enabled:
-                    tab.schedule_spellcheck()
-                else:
+            for i in range(self.tabs.count()):
+                tab = self.tabs.widget(i)
+                if isinstance(tab, EditorTab):
                     tab.spellcheck_timer.stop()
                     tab.misspellings = []
                     tab.apply_annotations()
@@ -4425,6 +4481,8 @@ class MainWindow(QMainWindow):
         self.tabs.setCurrentWidget(tab)
         tab.editor.setFocus()
         self.commit_snapshot_boundary(tab, "new_tab")
+        if self.prefs.get("spellcheck_enabled", False):
+            QTimer.singleShot(250, tab.schedule_spellcheck)
         return tab
 
     def refresh_tab_title(self, tab):
@@ -4545,6 +4603,8 @@ class MainWindow(QMainWindow):
             self.remember_folder_from_path(str(p))
             self.add_recent(str(p))
             self.commit_snapshot_boundary(tab, "open")
+            if self.prefs.get("spellcheck_enabled", False):
+                QTimer.singleShot(250, tab.schedule_spellcheck)
             self.status(f"Opened: {p}")
             return tab
         except Exception as exc:
@@ -4577,6 +4637,8 @@ class MainWindow(QMainWindow):
             tab.doc.dirty = True
             self.tabs.addTab(tab, tab.tab_name())
             self.commit_snapshot_boundary(tab, "recover")
+            if self.prefs.get("spellcheck_enabled", False):
+                QTimer.singleShot(250, tab.schedule_spellcheck)
             return True
         except Exception:
             return False
@@ -5111,6 +5173,7 @@ class MainWindow(QMainWindow):
 
         QTimer.singleShot(0, self.restore_saved_view_state)
         self.status("Previous session restored.")
+        QTimer.singleShot(100, self.activate_spellcheck_after_startup)
 
     def load_state_or_new(self):
         # Last-open-tabs restoration remains automatic, but it is now asynchronous:
@@ -5143,6 +5206,7 @@ class MainWindow(QMainWindow):
             if not opened:
                 self.new_tab()
             QTimer.singleShot(0, self.restore_saved_view_state)
+            QTimer.singleShot(400, self.schedule_spellcheck_for_all_tabs)
             return
 
         self.prepare_async_session_restore(state)
@@ -5160,6 +5224,7 @@ class MainWindow(QMainWindow):
         else:
             self.new_tab()
             QTimer.singleShot(0, self.restore_saved_view_state)
+            QTimer.singleShot(400, self.schedule_spellcheck_for_all_tabs)
 
     def schedule_save_state(self):
         # Save soon, after Qt has applied visibility/layout changes.
@@ -5339,8 +5404,151 @@ class MainWindow(QMainWindow):
             print(f"AstroEditor save_state during close failed: {exc}", flush=True)
         event.accept()
 
+    def bring_window_forward_preserving_state(self):
+        """Bring window forward without leaving fullscreen/maximized mode.
+
+        showNormal() exits fullscreen on GNOME/Qt, so only clear minimized state
+        when the window is actually minimized. Otherwise preserve the current
+        state and simply request activation.
+        """
+        try:
+            if self.isMinimized():
+                self.setWindowState((self.windowState() & ~Qt.WindowMinimized) | Qt.WindowActive)
+        except Exception:
+            pass
+        self.raise_()
+        self.activateWindow()
+
+    def open_files_from_external_request(self, paths):
+        """Open files sent by a later AstroEditorPro process.
+
+        This is used by Nautilus/file-manager double-clicks. If a window is
+        already open, the new process sends the requested path here and exits,
+        so the file opens as a tab in the existing window.
+        """
+        opened_any = False
+        for raw_path in paths or []:
+            try:
+                p = self.normalize_startup_path(raw_path)
+                if p is None or not p.exists():
+                    continue
+
+                # If already open, focus the existing tab instead of duplicating it.
+                try:
+                    target = str(p.resolve())
+                except Exception:
+                    target = str(p)
+
+                for i in range(self.tabs.count()):
+                    tab = self.tabs.widget(i)
+                    if not isinstance(tab, EditorTab):
+                        continue
+                    tab_path = tab.doc.path or tab.doc.autosave_path
+                    if not tab_path:
+                        continue
+                    try:
+                        current = str(Path(tab_path).expanduser().resolve())
+                    except Exception:
+                        current = str(tab_path)
+                    if current == target:
+                        self.tabs.setCurrentIndex(i)
+                        self.bring_window_forward_preserving_state()
+                        self.status(f"Already open: {p}")
+                        opened_any = True
+                        break
+                else:
+                    if is_autosave_file(p):
+                        opened_any = self.open_autosave(str(p)) or opened_any
+                    else:
+                        opened_any = bool(self.open_file(str(p))) or opened_any
+            except Exception as exc:
+                print(f"AstroEditor could not open external file request {raw_path}: {exc}", flush=True)
+
+        if opened_any:
+            self.bring_window_forward_preserving_state()
+            self.status("Opened file in existing AstroEditorPro window.")
+
     def status(self, message):
         self.statusBar().showMessage(message, 5000)
+
+
+def send_files_to_running_instance(paths) -> bool:
+    """Send file-open request to an already-running AstroEditorPro instance.
+
+    Returns True if the request was delivered. Used only when this process was
+    launched with file arguments, e.g. by Nautilus double-click/Open With.
+    """
+    if not paths:
+        return False
+
+    socket = QLocalSocket()
+    socket.connectToServer(SINGLE_INSTANCE_SERVER_NAME)
+    if not socket.waitForConnected(250):
+        return False
+
+    payload = {
+        "action": "open_files",
+        "paths": [str(p) for p in paths],
+    }
+    data = (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
+    socket.write(data)
+    socket.flush()
+    socket.waitForBytesWritten(500)
+    socket.disconnectFromServer()
+    return True
+
+
+def setup_single_instance_server(window):
+    """Listen for later file-open requests from new AstroEditorPro processes."""
+    server = QLocalServer(window)
+
+    def start_listening():
+        if server.listen(SINGLE_INSTANCE_SERVER_NAME):
+            return True
+        # A stale socket file can remain after a crash. Remove and retry.
+        QLocalServer.removeServer(SINGLE_INSTANCE_SERVER_NAME)
+        return server.listen(SINGLE_INSTANCE_SERVER_NAME)
+
+    if not start_listening():
+        print(f"AstroEditor could not start local file-open server: {server.errorString()}", flush=True)
+        return None
+
+    def handle_socket(socket):
+        buffer = bytearray()
+
+        def read_available():
+            nonlocal buffer
+            try:
+                buffer.extend(bytes(socket.readAll()))
+                while b"\n" in buffer:
+                    line, _, rest = buffer.partition(b"\n")
+                    buffer = bytearray(rest)
+                    if not line.strip():
+                        continue
+                    try:
+                        msg = json.loads(line.decode("utf-8"))
+                    except Exception as exc:
+                        print(f"AstroEditor ignored bad IPC message: {exc}", flush=True)
+                        continue
+
+                    if msg.get("action") == "open_files":
+                        paths = msg.get("paths") or []
+                        QTimer.singleShot(0, lambda paths=paths: window.open_files_from_external_request(paths))
+            except Exception as exc:
+                print(f"AstroEditor IPC read failed: {exc}", flush=True)
+
+        socket.readyRead.connect(read_available)
+        socket.disconnected.connect(socket.deleteLater)
+        read_available()
+
+    def on_new_connection():
+        while server.hasPendingConnections():
+            socket = server.nextPendingConnection()
+            handle_socket(socket)
+
+    server.newConnection.connect(on_new_connection)
+    window._single_instance_server = server
+    return server
 
 
 def load_fonts_from_folder():
@@ -5387,7 +5595,15 @@ def main():
                 f.write(datetime.now().isoformat(timespec="seconds") + " " + repr(startup_files) + "\n")
         except Exception:
             pass
+
+        # If AstroEditorPro is already running, send these files to that window
+        # and exit. This makes Nautilus double-click/Open With open a new tab in
+        # the existing window instead of launching another full window.
+        if "--new-window" not in args and send_files_to_running_instance(startup_files):
+            sys.exit(0)
+
     window = MainWindow(startup_files=startup_files, restore_session=restore_session)
+    setup_single_instance_server(window)
     window.show()
     exit_code = app.exec()
     cleanup_embedded_image_cache()
